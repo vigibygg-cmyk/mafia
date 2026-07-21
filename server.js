@@ -1,29 +1,7 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-
-const app = express();
-const server = http.createServer(app);
-
-const io = new Server(server, {
-    cors: {
-        origin: "*", 
-        methods: ["GET", "POST"]
-    }
-});
-
-// Centrinė žaidimo būsena
-let gameState = {
-    phase: 'LOBBY', // Galimos fazės: LOBBY, NIGHT, DAY_DISCUSSION, DAY_VOTING
-    players: {},    // Žaidėjų sąrašas (raktas: socket.id)
-    votes: {}       // Balsavimo rezultatai
-};
-
 io.on('connection', (socket) => {
-    // 1. Žaidėjo prisijungimas į laukiamąjį
     socket.on('join_game', (playerName) => {
         if (gameState.phase !== 'LOBBY') {
-            socket.emit('error_message', 'Žaidimas jau prasidėjęs. Prisijungti negalima.');
+            socket.emit('error_message', 'Žaidimas jau prasidėjęs.');
             return;
         }
         
@@ -33,21 +11,57 @@ io.on('connection', (socket) => {
             role: null,
             isAlive: true
         };
-        
-        // Atnaujinto sąrašo išsiuntimas visiems klientams
         io.emit('update_players', Object.values(gameState.players));
     });
 
-    // 2. Atsijungimo valdymas LOBBY fazėje
+    // Žaidimo paleidimo signalas iš kliento
+    socket.on('start_game', () => {
+        const playerIds = Object.keys(gameState.players);
+        
+        // Griežtas apribojimas pagal ankstesnį susitarimą
+        if (playerIds.length < 6) {
+            socket.emit('error_message', 'Žaidimą galima pradėti tik turint bent 6 žaidėjus.');
+            return;
+        }
+
+        if (gameState.phase !== 'LOBBY') return;
+
+        // Būsenos keitimas
+        gameState.phase = 'NIGHT';
+        
+        // Žaidėjų sąrašo sumaišymas (Fisher-Yates algoritmas)
+        for (let i = playerIds.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [playerIds[i], playerIds[j]] = [playerIds[j], playerIds[i]];
+        }
+
+        // Vaidmenų paskirstymas (1 Mafija (arba 2, jei 8+ žaidėjai), 1 Detektyvas, 1 Daktaras, kiti Miestiečiai)
+        let mafiaCount = playerIds.length >= 8 ? 2 : 1;
+        let assigned = 0;
+        
+        for(let i=0; i<mafiaCount; i++) gameState.players[playerIds[assigned++]].role = 'MAFIJA';
+        gameState.players[playerIds[assigned++]].role = 'DETEKTYVAS';
+        gameState.players[playerIds[assigned++]].role = 'DAKTARAS';
+        
+        while(assigned < playerIds.length) {
+            gameState.players[playerIds[assigned++]].role = 'MIESTIETIS';
+        }
+
+        // Kiekvienam žaidėjui asmeniškai išsiunčiamas tik jo vaidmuo, kad kiti nematytų
+        playerIds.forEach(id => {
+            const playerRole = gameState.players[id].role;
+            io.to(id).emit('game_started', playerRole);
+        });
+    });
+
     socket.on('disconnect', () => {
         if (gameState.players[socket.id]) {
             delete gameState.players[socket.id];
-            io.emit('update_players', Object.values(gameState.players));
+            // Jei atjungiama LOBBY fazėje - atnaujinam sąrašą.
+            // Jei žaidimo metu - tolesnė logika (bus rašoma vėliau).
+            if (gameState.phase === 'LOBBY') {
+                io.emit('update_players', Object.values(gameState.players));
+            }
         }
     });
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Serveris sėkmingai pasileido ant prievado ${PORT}`);
 });
