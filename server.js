@@ -56,7 +56,7 @@ function deleteRoom(roomCode) {
     if (rooms[roomCode]) {
         if (rooms[roomCode].inactivityTimer) clearTimeout(rooms[roomCode].inactivityTimer);
         if (rooms[roomCode].disconnectTimer) clearTimeout(rooms[roomCode].disconnectTimer);
-        io.to(roomCode).emit('game_reset', 'ROOM_DELETED');
+        io.to(roomCode).emit('game_reset', 'MSG_ROOM_DELETED');
         delete rooms[roomCode];
     }
 }
