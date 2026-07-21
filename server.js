@@ -12,11 +12,10 @@ const io = new Server(server, {
     }
 });
 
-// Kambarių talpykla: rooms[roomCode] = { phase, players, nightActions, dayVotes, timers }
 let rooms = {};
 
-const INACTIVITY_LIMIT = 20 * 60 * 1000; // 20 minučių
-const DISCONNECT_LIMIT = 5 * 60 * 1000;   // 5 minutės
+const INACTIVITY_LIMIT = 20 * 60 * 1000;
+const DISCONNECT_LIMIT = 5 * 60 * 1000;
 
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
@@ -28,7 +27,6 @@ function resetInactivityTimer(roomCode) {
     
     if (room.inactivityTimer) clearTimeout(room.inactivityTimer);
     room.inactivityTimer = setTimeout(() => {
-        console.log(`Kambarys ${roomCode} išvalytas dėl 20 min. neveiklumo.`);
         deleteRoom(roomCode);
     }, INACTIVITY_LIMIT);
 }
@@ -43,7 +41,6 @@ function checkDisconnectStatus(roomCode) {
     if (room.phase !== 'LOBBY' && activeSocketsCount < 6) {
         if (!room.disconnectTimer) {
             room.disconnectTimer = setTimeout(() => {
-                console.log(`Kambaryje ${roomCode} žaidėjai negrįžo per 5 min. Kambarys išvalomas.`);
                 deleteRoom(roomCode);
             }, DISCONNECT_LIMIT);
         }
@@ -64,12 +61,24 @@ function deleteRoom(roomCode) {
     }
 }
 
+function assignHostIfMissing(roomCode) {
+    const room = rooms[roomCode];
+    if (!room) return;
+    
+    const playerIds = Object.keys(room.players);
+    if (playerIds.length === 0) return;
+
+    const hasHost = playerIds.some(id => room.players[id].isHost);
+    if (!hasHost) {
+        // Pirmas sąraše esantis žaidėjas tampa nauju Host
+        room.players[playerIds[0]].isHost = true;
+    }
+}
+
 io.on('connection', (socket) => {
-    // 1. Kambario kūrimas arba prisijungimas
     socket.on('join_game', ({ playerName, roomCode }) => {
         let code = roomCode ? roomCode.trim().toUpperCase() : null;
 
-        // Jei kodas nenurodytas - kuriamas naujas kambarys
         if (!code) {
             code = generateRoomCode();
             rooms[code] = {
@@ -89,7 +98,6 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Reconnection logika
         const existingSocketId = Object.keys(room.players).find(
             id => room.players[id].name.toLowerCase() === playerName.toLowerCase()
         );
@@ -97,6 +105,7 @@ io.on('connection', (socket) => {
         socket.join(code);
         socket.roomCode = code;
 
+        // Reconnection
         if (existingSocketId && room.phase !== 'LOBBY') {
             const playerData = room.players[existingSocketId];
             delete room.players[existingSocketId];
@@ -104,12 +113,15 @@ io.on('connection', (socket) => {
             playerData.id = socket.id;
             room.players[socket.id] = playerData;
 
+            assignHostIfMissing(code);
+
             socket.emit('phase_change', {
                 roomCode: code,
                 phase: room.phase,
                 role: playerData.role,
                 isAlive: playerData.isAlive,
-                players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive }))
+                isHost: playerData.isHost,
+                players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
             });
 
             resetInactivityTimer(code);
@@ -122,22 +134,33 @@ io.on('connection', (socket) => {
             return;
         }
 
+        const isFirstPlayer = Object.keys(room.players).length === 0;
+
         room.players[socket.id] = {
             id: socket.id,
             name: playerName,
             role: null,
-            isAlive: true
+            isAlive: true,
+            isHost: isFirstPlayer // Pirmas prisijungęs tampa kambario Host
         };
 
         resetInactivityTimer(code);
-        io.to(code).emit('update_players', { roomCode: code, players: Object.values(room.players) });
+        io.to(code).emit('update_players', { 
+            roomCode: code, 
+            players: Object.values(room.players)
+        });
     });
 
-    // 2. Žaidimo pradžia kambaryje
     socket.on('start_game', () => {
         const code = socket.roomCode;
         const room = rooms[code];
         if (!room) return;
+
+        const player = room.players[socket.id];
+        if (!player || !player.isHost) {
+            socket.emit('error_message', 'Tik kambario šeimininkas (Host) gali pradėti žaidimą.');
+            return;
+        }
 
         resetInactivityTimer(code);
         const playerIds = Object.keys(room.players);
@@ -168,7 +191,6 @@ io.on('connection', (socket) => {
         startNightPhase(code);
     });
 
-    // 3. Nakties veiksmai
     socket.on('night_action', (targetId) => {
         const code = socket.roomCode;
         const room = rooms[code];
@@ -195,7 +217,6 @@ io.on('connection', (socket) => {
         checkNightPhaseEnd(code);
     });
 
-    // 4. Dienos balsavimas
     socket.on('cast_vote', (targetId) => {
         const code = socket.roomCode;
         const room = rooms[code];
@@ -213,13 +234,43 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 5. Kambario atstatymas
+    // Tik Host gali atlikti RESET
     socket.on('reset_game', () => {
         const code = socket.roomCode;
-        if (code) deleteRoom(code);
+        const room = rooms[code];
+        if (!room) return;
+
+        const player = room.players[socket.id];
+        if (player && player.isHost) {
+            deleteRoom(code);
+        } else {
+            socket.emit('error_message', 'Tik kambario šeimininkas (Host) gali išvalyti kambarį.');
+        }
     });
 
-    // 6. Atsijungimas
+    // Žaidėjas pats nusprendžia išeiti iš kambario
+    socket.on('leave_room', () => {
+        const code = socket.roomCode;
+        const room = rooms[code];
+
+        if (room && room.players[socket.id]) {
+            delete room.players[socket.id];
+            socket.leave(code);
+            socket.roomCode = null;
+
+            assignHostIfMissing(code);
+
+            if (Object.keys(room.players).length === 0) {
+                deleteRoom(code);
+            } else {
+                io.to(code).emit('update_players', { 
+                    roomCode: code, 
+                    players: Object.values(room.players)
+                });
+            }
+        }
+    });
+
     socket.on('disconnect', () => {
         const code = socket.roomCode;
         const room = rooms[code];
@@ -227,7 +278,11 @@ io.on('connection', (socket) => {
         if (room && room.players[socket.id]) {
             if (room.phase === 'LOBBY') {
                 delete room.players[socket.id];
-                io.to(code).emit('update_players', { roomCode: code, players: Object.values(room.players) });
+                assignHostIfMissing(code);
+                io.to(code).emit('update_players', { 
+                    roomCode: code, 
+                    players: Object.values(room.players)
+                });
             }
             
             checkDisconnectStatus(code);
@@ -253,7 +308,8 @@ function startNightPhase(roomCode) {
             phase: 'NIGHT',
             role: p.role,
             isAlive: p.isAlive,
-            players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive }))
+            isHost: p.isHost,
+            players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
         });
     });
 }
@@ -300,7 +356,7 @@ function processNightResults(roomCode) {
         roomCode: roomCode,
         phase: 'DAY_VOTING',
         killedPlayer: killedPlayer,
-        players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive }))
+        players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
     });
 }
 
