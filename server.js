@@ -175,7 +175,12 @@ io.on('connection', (socket) => {
             [playerIds[i], playerIds[j]] = [playerIds[j], playerIds[i]];
         }
 
-        let mafiaCount = playerIds.length >= 8 ? 2 : 1;
+        // MAFIJOS SKAIČIAUS MATEMATIKA PAGAL ŽAIDĖJŲ KIEKĮ
+        let mafiaCount = 1;
+        if (playerIds.length >= 8 && playerIds.length <= 11) mafiaCount = 2;
+        else if (playerIds.length >= 12 && playerIds.length <= 17) mafiaCount = 3;
+        else if (playerIds.length >= 18) mafiaCount = 4;
+
         let assigned = 0;
         
         for(let i=0; i<mafiaCount; i++) room.players[playerIds[assigned++]].role = 'ROLE_MAFIA';
@@ -198,6 +203,7 @@ io.on('connection', (socket) => {
         const player = room.players[socket.id];
         if (!player || !player.isAlive || room.phase !== 'NIGHT') return;
 
+        // Jei yra kelios mafijos, serveris įsimena to taikinį, kuris paspaudė paskutinis.
         if (player.role === 'ROLE_MAFIA') {
             room.nightActions.mafiaTarget = targetId;
         } else if (player.role === 'ROLE_DOCTOR') {
