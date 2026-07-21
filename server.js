@@ -13,7 +13,7 @@ const io = new Server(server, {
 });
 
 let gameState = {
-    phase: 'LOBBY', // LOBBY, NIGHT, DAY_DISCUSSION, DAY_VOTING
+    phase: 'LOBBY',
     players: {},
     nightActions: {
         mafiaTarget: null,
@@ -24,6 +24,8 @@ let gameState = {
 };
 
 io.on('connection', (socket) => {
+    console.log('Naujas prisijungimas:', socket.id);
+
     // 1. Prisijungimas
     socket.on('join_game', (playerName) => {
         if (gameState.phase !== 'LOBBY') {
@@ -37,19 +39,27 @@ io.on('connection', (socket) => {
             role: null,
             isAlive: true
         };
+        console.log(`Žaidėjas ${playerName} prisijungė. Viso: ${Object.keys(gameState.players).length}`);
         io.emit('update_players', Object.values(gameState.players));
     });
 
     // 2. Žaidimo pradžia
     socket.on('start_game', () => {
+        console.log('Gautas prašymas pradėti žaidimą...');
         const playerIds = Object.keys(gameState.players);
         
         if (playerIds.length < 6) {
-            socket.emit('error_message', 'Reikia bent 6 žaidėjų!');
+            console.log(`Trūksta žaidėjų: yra ${playerIds.length}, reikia 6.`);
+            socket.emit('error_message', `Trūksta žaidėjų! Dabar prisijungę tik ${playerIds.length}, o reikia bent 6.`);
             return;
         }
 
-        if (gameState.phase !== 'LOBBY') return;
+        if (gameState.phase !== 'LOBBY') {
+            socket.emit('error_message', 'Žaidimas jau vyksta!');
+            return;
+        }
+
+        console.log('Pradedamas žaidimas, dalinami vaidmenys...');
 
         // Sumaišom žaidėjus
         for (let i = playerIds.length - 1; i > 0; i--) {
@@ -101,7 +111,6 @@ io.on('connection', (socket) => {
 
         gameState.dayVotes[socket.id] = targetId;
         
-        // Patikrinam, ar visi gyvi atidavė balsus
         const alivePlayers = Object.values(gameState.players).filter(p => p.isAlive);
         if (Object.keys(gameState.dayVotes).length >= alivePlayers.length) {
             processDayVotingResults();
@@ -110,6 +119,7 @@ io.on('connection', (socket) => {
 
     // 5. Atsijungimas
     socket.on('disconnect', () => {
+        console.log('Atsijungė:', socket.id);
         if (gameState.players[socket.id]) {
             delete gameState.players[socket.id];
             if (gameState.phase === 'LOBBY') {
@@ -123,6 +133,8 @@ function startNightPhase() {
     gameState.phase = 'NIGHT';
     gameState.nightActions = { mafiaTarget: null, doctorTarget: null, detectiveTarget: null };
 
+    console.log('Fazė pakeista į: NIGHT');
+
     Object.keys(gameState.players).forEach(id => {
         const p = gameState.players[id];
         io.to(id).emit('phase_change', {
@@ -135,7 +147,6 @@ function startNightPhase() {
 }
 
 function checkNightPhaseEnd() {
-    // Paprasta taisyklė: kai Mafija ir Daktaras atlieka veiksmus - naktis baigiasi
     const hasMafia = Object.values(gameState.players).some(p => p.role === 'MAFIJA' && p.isAlive);
     const hasDoctor = Object.values(gameState.players).some(p => p.role === 'DAKTARAS' && p.isAlive);
 
@@ -161,6 +172,8 @@ function processNightResults() {
 
     const killedPlayer = killedId ? gameState.players[killedId].name : null;
 
+    console.log('Fazė pakeista į: DAY_VOTING. Nužudytas:', killedPlayer);
+
     io.emit('phase_change', {
         phase: 'DAY_VOTING',
         killedPlayer: killedPlayer,
@@ -169,7 +182,6 @@ function processNightResults() {
 }
 
 function processDayVotingResults() {
-    // Suskaičiuojam balsus
     const voteCounts = {};
     Object.values(gameState.dayVotes).forEach(targetId => {
         voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
@@ -188,9 +200,6 @@ function processDayVotingResults() {
         gameState.players[executedId].isAlive = false;
     }
 
-    const executedPlayer = executedId ? gameState.players[executedId].name : null;
-
-    // Po balsavimo vėl prasideda naktis
     startNightPhase();
 }
 
