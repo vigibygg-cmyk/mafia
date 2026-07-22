@@ -12,7 +12,7 @@ const io = new Server(server, {
 let rooms = {};
 
 const INACTIVITY_LIMIT = 20 * 60 * 1000;
-const NIGHT_DURATION = 30; // Sekundės nakties veiksmams
+const NIGHT_DURATION = 180; // Sekundės nakties veiksmams
 
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
