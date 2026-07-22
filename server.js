@@ -16,6 +16,7 @@ const INACTIVITY_LIMIT = 10 * 60 * 1000;
 const NIGHT_DURATION = 180; // Sekundės nakties veiksmams
 const DAY_VOTE_LIMIT = 5 * 60 * 1000;    // Apsauga: jei kas nors neprisijungęs/AFK - diena vis tiek pasibaigs
 const DEFENSE_VOTE_LIMIT = 3 * 60 * 1000; // Apsauga: gynybinis balsavimas irgi negali kaboti amžinai
+const RECONNECT_GRACE_MS = 20 * 1000; // Kiek laiko laukiamajame laukiame, kol žaidėjas persijungs po refresh
 
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
@@ -83,22 +84,49 @@ io.on('connection', (socket) => {
         socket.join(code);
         socket.roomCode = code;
 
-        if (existingSocketId && room.phase !== 'LOBBY') {
-            const playerData = room.players[existingSocketId];
+        if (existingSocketId) {
+            const existingPlayer = room.players[existingSocketId];
+
+            if (existingPlayer.connected) {
+                // Kažkas kitas šiuo metu realiai prisijungęs tuo pačiu vardu - tikras vardo susidūrimas.
+                socket.emit('error_message', 'ERR_NAME_TAKEN');
+                return;
+            }
+
+            // Tai persijungimas (pvz. po lango atnaujinimo) - grąžiname žmogų į tą pačią vietą,
+            // nepriklausomai nuo to, kokia žaidimo fazė šiuo metu vyksta.
+            if (existingPlayer.leaveTimer) {
+                clearTimeout(existingPlayer.leaveTimer);
+                existingPlayer.leaveTimer = null;
+            }
+
             delete room.players[existingSocketId];
-            playerData.id = socket.id;
-            room.players[socket.id] = playerData;
+            existingPlayer.id = socket.id;
+            existingPlayer.connected = true;
+            room.players[socket.id] = existingPlayer;
+
+            if (room.accusedId === existingSocketId) room.accusedId = socket.id;
 
             assignHostIfMissing(code);
-            socket.emit('phase_change', {
-                roomCode: code,
-                phase: room.phase,
-                role: playerData.role,
-                isAlive: playerData.isAlive,
-                isHost: playerData.isHost,
-                accusedName: room.accusedId && room.players[room.accusedId] ? room.players[room.accusedId].name : null,
-                players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
-            });
+            resetInactivityTimer(code);
+
+            if (room.phase === 'LOBBY') {
+                io.to(code).emit('update_players', { roomCode: code, players: Object.values(room.players) });
+            } else if (room.phase === 'GAME_OVER' && room.lastGameOver) {
+                socket.emit('game_over', room.lastGameOver);
+            } else {
+                socket.emit('phase_change', {
+                    roomCode: code,
+                    phase: room.phase,
+                    role: existingPlayer.role,
+                    isAlive: existingPlayer.isAlive,
+                    isHost: existingPlayer.isHost,
+                    accusedName: room.accusedId && room.players[room.accusedId] ? room.players[room.accusedId].name : null,
+                    accusedId: room.accusedId || null,
+                    timer: room.phase === 'NIGHT' ? room.timerSeconds : undefined,
+                    players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
+                });
+            }
             return;
         }
 
@@ -109,7 +137,8 @@ io.on('connection', (socket) => {
             name: playerName,
             role: null,
             isAlive: true,
-            isHost: Object.keys(room.players).length === 0
+            isHost: Object.keys(room.players).length === 0,
+            connected: true
         };
 
         resetInactivityTimer(code);
@@ -238,6 +267,7 @@ io.on('connection', (socket) => {
         room.detectiveTarget = null;
         room.dayVotes = {};
         room.accusedId = null;
+        room.lastGameOver = null;
 
         Object.keys(room.players).forEach(id => {
             room.players[id].role = null;
@@ -256,6 +286,7 @@ io.on('connection', (socket) => {
         const code = socket.roomCode;
         const room = rooms[code];
         if (room && room.players[socket.id]) {
+            if (room.players[socket.id].leaveTimer) clearTimeout(room.players[socket.id].leaveTimer);
             delete room.players[socket.id];
             socket.leave(code);
             socket.roomCode = null;
@@ -269,12 +300,23 @@ io.on('connection', (socket) => {
         const code = socket.roomCode;
         const room = rooms[code];
         if (room && room.players[socket.id]) {
-            if (room.phase === 'LOBBY' || room.phase === 'GAME_OVER') {
-                delete room.players[socket.id];
-                assignHostIfMissing(code);
-                io.to(code).emit('update_players', { roomCode: code, players: Object.values(room.players) });
+            const player = room.players[socket.id];
+            player.connected = false;
+
+            if (room.phase === 'LOBBY') {
+                // Laukiamajame duodame trumpą laiką (persijungimui po refresh), tik tada realiai pašaliname.
+                player.leaveTimer = setTimeout(() => {
+                    const r = rooms[code];
+                    if (r && r.players[socket.id] && !r.players[socket.id].connected) {
+                        delete r.players[socket.id];
+                        assignHostIfMissing(code);
+                        io.to(code).emit('update_players', { roomCode: code, players: Object.values(r.players) });
+                        if (Object.keys(r.players).length === 0) deleteRoom(code);
+                    }
+                }, RECONNECT_GRACE_MS);
             }
-            if (Object.keys(room.players).length === 0) deleteRoom(code);
+            // NIGHT / DAY_VOTING / DAY_DEFENSE / GAME_OVER metu žaidėjas NEŠALINAMAS -
+            // jis lieka "vaiduokliu", kad galėtų persijungti (rejoin) tuo pačiu vardu bet kada.
         }
     });
 });
@@ -448,10 +490,12 @@ function checkWinCondition(roomCode) {
     if (winner) {
         if (room.nightTimer) clearInterval(room.nightTimer);
         room.phase = 'GAME_OVER';
-        io.to(roomCode).emit('game_over', {
+        const payload = {
             winner: winner,
             summary: Object.values(room.players).map(x => ({ name: x.name, role: x.role, isAlive: x.isAlive }))
-        });
+        };
+        room.lastGameOver = payload;
+        io.to(roomCode).emit('game_over', payload);
         return true;
     }
     return false;
