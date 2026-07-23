@@ -54,9 +54,27 @@ function assignHostIfMissing(roomCode) {
     }
 }
 
+// Apsauga: viena netikėta klaida bet kuriame įvykio apdorojime NEBETURI nutraukti viso proceso
+// (anksčiau bet koks netikėtas duomenų formatas registruojantis galėjo sugriauti visą serverį visiems).
+process.on('uncaughtException', (err) => {
+    console.error('NETIKĖTA KLAIDA (serveris tęsia darbą):', err);
+});
+process.on('unhandledRejection', (err) => {
+    console.error('NEAPDOROTAS PAŽADO ATMETIMAS (serveris tęsia darbą):', err);
+});
+
 io.on('connection', (socket) => {
-    socket.on('join_game', ({ playerName, roomCode }) => {
-        let code = roomCode ? roomCode.trim().toUpperCase() : null;
+    socket.on('join_game', (data) => {
+      try {
+        const { playerName, roomCode } = data || {};
+
+        if (typeof playerName !== 'string' || playerName.trim().length === 0 || playerName.trim().length > 20) {
+            socket.emit('error_message', 'ERR_BAD_NAME');
+            return;
+        }
+        const cleanName = playerName.trim();
+
+        let code = roomCode ? String(roomCode).trim().toUpperCase() : null;
 
         if (!code) {
             code = generateRoomCode();
@@ -78,7 +96,7 @@ io.on('connection', (socket) => {
         if (!room) return socket.emit('error_message', 'ERR_ROOM_NOT_FOUND');
 
         const existingSocketId = Object.keys(room.players).find(
-            id => room.players[id].name.toLowerCase() === playerName.toLowerCase()
+            id => room.players[id].name.toLowerCase() === cleanName.toLowerCase()
         );
 
         socket.join(code);
@@ -134,7 +152,7 @@ io.on('connection', (socket) => {
 
         room.players[socket.id] = {
             id: socket.id,
-            name: playerName,
+            name: cleanName,
             role: null,
             isAlive: true,
             isHost: Object.keys(room.players).length === 0,
@@ -143,6 +161,10 @@ io.on('connection', (socket) => {
 
         resetInactivityTimer(code);
         io.to(code).emit('update_players', { roomCode: code, players: Object.values(room.players) });
+      } catch (err) {
+        console.error('Klaida join_game metu (nesugriuvo visas serveris):', err);
+        socket.emit('error_message', 'ERR_ROOM_NOT_FOUND');
+      }
     });
 
     socket.on('start_game', () => {
@@ -205,14 +227,14 @@ io.on('connection', (socket) => {
                 io.to(sid).emit('mafia_votes_update', votesSummary);
             });
         } else if (player.role === 'ROLE_DOCTOR') {
+            // Taisyklės: gydytojas gali apsigalvoti - kiekvienas paspaudimas PAKEIČIA ankstesnį
+            // pasirinkimą, galioja tik paskutinis. Rezultatas paskelbiamas tik ryte.
             room.doctorTarget = targetId;
+            room.doctorActed = true;
         } else if (player.role === 'ROLE_DETECTIVE') {
-            const targetPlayer = room.players[targetId];
-            socket.emit('detective_result', {
-                targetName: targetPlayer ? targetPlayer.name : 'Unknown',
-                isMafia: targetPlayer ? targetPlayer.role === 'ROLE_MAFIA' : false
-            });
+            // Taip pat ir detektyvas - gali keisti pasirinkimą iki nakties pabaigos, galioja paskutinis.
             room.detectiveTarget = targetId;
+            room.detectiveActed = true;
         }
         // ROLE_CITIZEN veiksmai ignoruojami serveryje (naudojami tik kaip dekoracija kliente)
     });
@@ -265,6 +287,8 @@ io.on('connection', (socket) => {
         room.mafiaVotes = {};
         room.doctorTarget = null;
         room.detectiveTarget = null;
+        room.doctorActed = false;
+        room.detectiveActed = false;
         room.dayVotes = {};
         room.accusedId = null;
         room.lastGameOver = null;
@@ -329,6 +353,8 @@ function startNightPhase(roomCode) {
     room.mafiaVotes = {};
     room.doctorTarget = null;
     room.detectiveTarget = null;
+    room.doctorActed = false;
+    room.detectiveActed = false;
     room.timerSeconds = NIGHT_DURATION;
 
     if (room.nightTimer) clearInterval(room.nightTimer);
@@ -385,6 +411,17 @@ function processNightResults(roomCode) {
         if (room.players[killedId]) room.players[killedId].isAlive = false;
     }
 
+    // Gydytojo/detektyvo rezultatai - paskelbiami tik dabar, ryte, ne iš karto nakties metu.
+    let doctorOutcome = 'NONE';
+    if (room.doctorActed) {
+        doctorOutcome = (mafiaTarget && room.doctorTarget && mafiaTarget === room.doctorTarget) ? 'SUCCESS' : 'FAIL';
+    }
+    let detectiveOutcome = 'NONE';
+    if (room.detectiveActed && room.detectiveTarget) {
+        const checkedPlayer = room.players[room.detectiveTarget];
+        detectiveOutcome = (checkedPlayer && checkedPlayer.role === 'ROLE_MAFIA') ? 'SUCCESS' : 'FAIL';
+    }
+
     if (checkWinCondition(roomCode)) return;
 
     room.phase = 'DAY_VOTING';
@@ -403,6 +440,8 @@ function processNightResults(roomCode) {
         roomCode: roomCode,
         phase: 'DAY_VOTING',
         killedPlayer: killedPlayer,
+        doctorOutcome: doctorOutcome,
+        detectiveOutcome: detectiveOutcome,
         players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
     });
 }
