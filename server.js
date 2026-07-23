@@ -18,6 +18,18 @@ const DAY_VOTE_LIMIT = 5 * 60 * 1000;    // Apsauga: jei kas nors neprisijungęs
 const DEFENSE_VOTE_LIMIT = 3 * 60 * 1000; // Apsauga: gynybinis balsavimas irgi negali kaboti amžinai
 const RECONNECT_GRACE_MS = 20 * 1000; // Kiek laiko laukiamajame laukiame, kol žaidėjas persijungs po refresh
 
+// ============================================================================
+// SVARBU: žaidėjo TAPATYBĖ dabar yra stabilus "token" (klientas jį sugeneruoja
+// ir saugo sessionStorage, siunčia su kiekvienu join_game), o NE socket.id.
+// Anksčiau viskas (balsai, kaltinamasis ir t.t.) buvo saugoma pagal socket.id,
+// kuris pasikeisdavo kiekvieną kartą atnaujinus (F5) puslapį - dėl to po
+// persijungimo senos balso/veiksmo įrašai "nukarodavo" (nebeatitikdavo joks
+// gyvo žaidėjo), balsavimai užstrigdavo, o vardo patikra klaidingai rodydavo
+// "jau užimtas". Dabar room.players yra raktas = token (pastovus), o
+// player.socketId nurodo, koks socket.id šiuo metu su juo susietas (jei
+// prisijungęs) - tai keičiasi laisvai, žaidimo logika nuo to nebepriklauso.
+// ============================================================================
+
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
 }
@@ -34,6 +46,7 @@ function clearAllRoomTimers(room) {
     if (room.inactivityTimer) clearTimeout(room.inactivityTimer);
     if (room.dayTimeout) clearTimeout(room.dayTimeout);
     if (room.defenseTimeout) clearTimeout(room.defenseTimeout);
+    Object.values(room.players).forEach(p => { if (p.leaveTimer) clearTimeout(p.leaveTimer); });
 }
 
 function deleteRoom(roomCode) {
@@ -47,15 +60,24 @@ function deleteRoom(roomCode) {
 function assignHostIfMissing(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
-    const playerIds = Object.keys(room.players);
-    if (playerIds.length === 0) return;
-    if (!playerIds.some(id => room.players[id].isHost)) {
-        room.players[playerIds[0]].isHost = true;
+    const ids = Object.keys(room.players);
+    if (ids.length === 0) return;
+    if (!ids.some(id => room.players[id].isHost)) {
+        room.players[ids[0]].isHost = true;
     }
 }
 
-// Apsauga: viena netikėta klaida bet kuriame įvykio apdorojime NEBETURI nutraukti viso proceso
-// (anksčiau bet koks netikėtas duomenų formatas registruojantis galėjo sugriauti visą serverį visiems).
+function publicPlayers(room) {
+    return Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }));
+}
+
+// Siunčia žinutę konkrečiam žaidėjui (pagal jo DABARTINĮ socket.id, jei prisijungęs).
+function sendToPlayer(room, playerId, event, payload) {
+    const p = room.players[playerId];
+    if (p && p.socketId) io.to(p.socketId).emit(event, payload);
+}
+
+// Apsauga: viena netikėta klaida bet kuriame įvykio apdorojime NEBETURI nutraukti viso proceso.
 process.on('uncaughtException', (err) => {
     console.error('NETIKĖTA KLAIDA (serveris tęsia darbą):', err);
 });
@@ -66,11 +88,13 @@ process.on('unhandledRejection', (err) => {
 io.on('connection', (socket) => {
     socket.on('join_game', (data) => {
       try {
-        const { playerName, roomCode } = data || {};
+        const { playerName, roomCode, token } = data || {};
 
         if (typeof playerName !== 'string' || playerName.trim().length === 0 || playerName.trim().length > 20) {
-            socket.emit('error_message', 'ERR_BAD_NAME');
-            return;
+            return socket.emit('error_message', 'ERR_BAD_NAME');
+        }
+        if (typeof token !== 'string' || token.length < 4 || token.length > 100) {
+            return socket.emit('error_message', 'ERR_BAD_NAME');
         }
         const cleanName = playerName.trim();
 
@@ -81,49 +105,29 @@ io.on('connection', (socket) => {
             rooms[code] = {
                 phase: 'LOBBY',
                 players: {},
-                mafiaVotes: {}, // key: voterSocketId, value: targetSocketId
-                doctorTarget: null,
-                detectiveTarget: null,
-                dayVotes: {},
-                accusedId: null,
+                mafiaVotes: {}, doctorTarget: null, detectiveTarget: null,
+                doctorActed: false, detectiveActed: false,
+                dayVotes: {}, accusedId: null,
                 defenseVotes: { yes: 0, no: 0, voted: {} },
-                timerSeconds: 0,
-                nightTimer: null
+                timerSeconds: 0, nightTimer: null
             };
         }
 
         const room = rooms[code];
         if (!room) return socket.emit('error_message', 'ERR_ROOM_NOT_FOUND');
 
-        const existingSocketId = Object.keys(room.players).find(
-            id => room.players[id].name.toLowerCase() === cleanName.toLowerCase()
-        );
-
         socket.join(code);
         socket.roomCode = code;
+        socket.playerToken = token;
 
-        if (existingSocketId) {
-            const existingPlayer = room.players[existingSocketId];
+        // 1) Šis token'as jau žinomas šiame kambaryje -> tai TAS PATS žaidėjas persijungia (refresh ir pan).
+        if (room.players[token]) {
+            const player = room.players[token];
+            if (player.leaveTimer) { clearTimeout(player.leaveTimer); player.leaveTimer = null; }
 
-            if (existingPlayer.connected) {
-                // Kažkas kitas šiuo metu realiai prisijungęs tuo pačiu vardu - tikras vardo susidūrimas.
-                socket.emit('error_message', 'ERR_NAME_TAKEN');
-                return;
-            }
-
-            // Tai persijungimas (pvz. po lango atnaujinimo) - grąžiname žmogų į tą pačią vietą,
-            // nepriklausomai nuo to, kokia žaidimo fazė šiuo metu vyksta.
-            if (existingPlayer.leaveTimer) {
-                clearTimeout(existingPlayer.leaveTimer);
-                existingPlayer.leaveTimer = null;
-            }
-
-            delete room.players[existingSocketId];
-            existingPlayer.id = socket.id;
-            existingPlayer.connected = true;
-            room.players[socket.id] = existingPlayer;
-
-            if (room.accusedId === existingSocketId) room.accusedId = socket.id;
+            player.name = cleanName; // leidžiam atnaujinti vardo rašybą, jei keitė
+            player.socketId = socket.id;
+            player.connected = true;
 
             assignHostIfMissing(code);
             resetInactivityTimer(code);
@@ -136,27 +140,36 @@ io.on('connection', (socket) => {
                 socket.emit('phase_change', {
                     roomCode: code,
                     phase: room.phase,
-                    role: existingPlayer.role,
-                    isAlive: existingPlayer.isAlive,
-                    isHost: existingPlayer.isHost,
+                    role: player.role,
+                    isAlive: player.isAlive,
+                    isHost: player.isHost,
                     accusedName: room.accusedId && room.players[room.accusedId] ? room.players[room.accusedId].name : null,
                     accusedId: room.accusedId || null,
                     timer: room.phase === 'NIGHT' ? room.timerSeconds : undefined,
-                    players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
+                    players: publicPlayers(room)
                 });
             }
             return;
         }
 
+        // 2) Naujas token'as, bet vardas jau naudojamas kito ŠIUO METU prisijungusio žaidėjo -> tikras konfliktas.
+        const nameClash = Object.values(room.players).find(
+            p => p.name.toLowerCase() === cleanName.toLowerCase() && p.connected
+        );
+        if (nameClash) return socket.emit('error_message', 'ERR_NAME_TAKEN');
+
+        // 3) Naujas žaidėjas - leidžiama tik laukiamajame.
         if (room.phase !== 'LOBBY') return socket.emit('error_message', 'ERR_ALREADY_STARTED');
 
-        room.players[socket.id] = {
-            id: socket.id,
+        room.players[token] = {
+            id: token,
             name: cleanName,
             role: null,
             isAlive: true,
             isHost: Object.keys(room.players).length === 0,
-            connected: true
+            connected: true,
+            socketId: socket.id,
+            leaveTimer: null
         };
 
         resetInactivityTimer(code);
@@ -172,7 +185,7 @@ io.on('connection', (socket) => {
         const room = rooms[code];
         if (!room) return;
 
-        const player = room.players[socket.id];
+        const player = room.players[socket.playerToken];
         if (!player || !player.isHost) return socket.emit('error_message', 'ERR_NOT_HOST');
 
         const playerIds = Object.keys(room.players);
@@ -181,7 +194,6 @@ io.on('connection', (socket) => {
 
         resetInactivityTimer(code);
 
-        // Sumaišymas
         for (let i = playerIds.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [playerIds[i], playerIds[j]] = [playerIds[j], playerIds[i]];
@@ -202,30 +214,27 @@ io.on('connection', (socket) => {
         startNightPhase(code);
     });
 
-    // TYLUS MAFIJOS BALSAVIMAS IR KITI VEIKSMAI
+    // TYLUS MAFIJOS BALSAVIMAS IR KITI NAKTIES VEIKSMAI
     socket.on('night_action', (targetId) => {
         const code = socket.roomCode;
         const room = rooms[code];
         if (!room || room.phase !== 'NIGHT') return;
 
-        const player = room.players[socket.id];
+        const player = room.players[socket.playerToken];
         if (!player || !player.isAlive) return;
 
         resetInactivityTimer(code);
 
         if (player.role === 'ROLE_MAFIA') {
-            room.mafiaVotes[socket.id] = targetId;
+            room.mafiaVotes[player.id] = targetId;
 
-            // Realaus laiko suvestinės siuntimas TIK MAFIJAI
-            const mafiaSockets = Object.values(room.players).filter(p => p.role === 'ROLE_MAFIA' && p.isAlive).map(p => p.id);
-            const votesSummary = {};
-            Object.values(room.mafiaVotes).forEach(tid => {
-                votesSummary[tid] = (votesSummary[tid] || 0) + 1;
-            });
+            const counts = {};
+            Object.values(room.mafiaVotes).forEach(tid => { counts[tid] = (counts[tid] || 0) + 1; });
 
-            mafiaSockets.forEach(sid => {
-                io.to(sid).emit('mafia_votes_update', votesSummary);
-            });
+            Object.values(room.players)
+                .filter(p => p.role === 'ROLE_MAFIA' && p.isAlive)
+                .forEach(p => sendToPlayer(room, p.id, 'mafia_votes_update', counts));
+
         } else if (player.role === 'ROLE_DOCTOR') {
             // Taisyklės: gydytojas gali apsigalvoti - kiekvienas paspaudimas PAKEIČIA ankstesnį
             // pasirinkimą, galioja tik paskutinis. Rezultatas paskelbiamas tik ryte.
@@ -245,32 +254,35 @@ io.on('connection', (socket) => {
         const room = rooms[code];
         if (!room || room.phase !== 'DAY_VOTING') return;
 
-        const player = room.players[socket.id];
+        const player = room.players[socket.playerToken];
         if (!player || !player.isAlive) return;
+        if (!room.players[targetId] || !room.players[targetId].isAlive) return;
 
         resetInactivityTimer(code);
-        room.dayVotes[socket.id] = targetId;
+        room.dayVotes[player.id] = targetId;
 
-        const alivePlayers = Object.values(room.players).filter(p => p.isAlive);
-        if (Object.keys(room.dayVotes).length >= alivePlayers.length) {
-            processDayVotingResults(code);
-        }
+        const aliveCount = Object.values(room.players).filter(p => p.isAlive).length;
+        const counts = {};
+        Object.values(room.dayVotes).forEach(tid => { counts[tid] = (counts[tid] || 0) + 1; });
+        const anyMajority = Object.values(counts).some(c => c > aliveCount / 2);
+        const allVoted = Object.keys(room.dayVotes).length >= aliveCount;
+
+        if (anyMajority || allVoted) processDayVotingResults(code);
     });
 
-    // GYNYBINĖS KALBOS PATVIRTINIMO BALSAVIMAS (TAIP / NE)
-    socket.on('defense_vote', (confirmElimination) => {
+    // GYNYBINĖS KALBOS BALSAVIMAS (TAIP/NE)
+    socket.on('defense_vote', (value) => {
         const code = socket.roomCode;
         const room = rooms[code];
         if (!room || room.phase !== 'DAY_DEFENSE') return;
 
-        const player = room.players[socket.id];
-        if (!player || !player.isAlive || room.defenseVotes.voted[socket.id]) return;
-        if (socket.id === room.accusedId) return; // kaltinamasis nebalsuoja dėl savo likimo
+        const player = room.players[socket.playerToken];
+        if (!player || !player.isAlive || room.defenseVotes.voted[player.id]) return;
+        if (player.id === room.accusedId) return; // kaltinamasis nebalsuoja dėl savo likimo
 
         resetInactivityTimer(code);
-        room.defenseVotes.voted[socket.id] = true;
-        if (confirmElimination) room.defenseVotes.yes++;
-        else room.defenseVotes.no++;
+        room.defenseVotes.voted[player.id] = true;
+        if (value) room.defenseVotes.yes++; else room.defenseVotes.no++;
 
         const eligibleVoters = Object.values(room.players).filter(p => p.isAlive && p.id !== room.accusedId);
         if (Object.keys(room.defenseVotes.voted).length >= eligibleVoters.length) {
@@ -281,7 +293,14 @@ io.on('connection', (socket) => {
     socket.on('play_again', () => {
         const code = socket.roomCode;
         const room = rooms[code];
-        if (!room || !room.players[socket.id]?.isHost) return;
+        if (!room) return;
+
+        const player = room.players[socket.playerToken];
+        if (!player || !player.isHost) return;
+
+        if (room.nightTimer) clearInterval(room.nightTimer);
+        if (room.dayTimeout) clearTimeout(room.dayTimeout);
+        if (room.defenseTimeout) clearTimeout(room.defenseTimeout);
 
         room.phase = 'LOBBY';
         room.mafiaVotes = {};
@@ -303,15 +322,20 @@ io.on('connection', (socket) => {
 
     socket.on('reset_game', () => {
         const code = socket.roomCode;
-        if (rooms[code]?.players[socket.id]?.isHost) deleteRoom(code);
+        const room = rooms[code];
+        if (!room) return;
+        const player = room.players[socket.playerToken];
+        if (player && player.isHost) deleteRoom(code);
+        else socket.emit('error_message', 'ERR_NOT_HOST');
     });
 
     socket.on('leave_room', () => {
         const code = socket.roomCode;
         const room = rooms[code];
-        if (room && room.players[socket.id]) {
-            if (room.players[socket.id].leaveTimer) clearTimeout(room.players[socket.id].leaveTimer);
-            delete room.players[socket.id];
+        if (room && room.players[socket.playerToken]) {
+            const player = room.players[socket.playerToken];
+            if (player.leaveTimer) clearTimeout(player.leaveTimer);
+            delete room.players[socket.playerToken];
             socket.leave(code);
             socket.roomCode = null;
             assignHostIfMissing(code);
@@ -323,16 +347,18 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         const code = socket.roomCode;
         const room = rooms[code];
-        if (room && room.players[socket.id]) {
-            const player = room.players[socket.id];
+        const token = socket.playerToken;
+        if (room && token && room.players[token] && room.players[token].socketId === socket.id) {
+            const player = room.players[token];
             player.connected = false;
+            player.socketId = null;
 
             if (room.phase === 'LOBBY') {
                 // Laukiamajame duodame trumpą laiką (persijungimui po refresh), tik tada realiai pašaliname.
                 player.leaveTimer = setTimeout(() => {
                     const r = rooms[code];
-                    if (r && r.players[socket.id] && !r.players[socket.id].connected) {
-                        delete r.players[socket.id];
+                    if (r && r.players[token] && !r.players[token].connected) {
+                        delete r.players[token];
                         assignHostIfMissing(code);
                         io.to(code).emit('update_players', { roomCode: code, players: Object.values(r.players) });
                         if (Object.keys(r.players).length === 0) deleteRoom(code);
@@ -340,7 +366,7 @@ io.on('connection', (socket) => {
                 }, RECONNECT_GRACE_MS);
             }
             // NIGHT / DAY_VOTING / DAY_DEFENSE / GAME_OVER metu žaidėjas NEŠALINAMAS -
-            // jis lieka "vaiduokliu", kad galėtų persijungti (rejoin) tuo pačiu vardu bet kada.
+            // jis lieka kambaryje kaip "vaiduoklis", kad galėtų persijungti bet kada tuo pačiu token'u.
         }
     });
 });
@@ -359,27 +385,26 @@ function startNightPhase(roomCode) {
 
     if (room.nightTimer) clearInterval(room.nightTimer);
 
-    // Laikmatis naktiniai fazei
     room.nightTimer = setInterval(() => {
         room.timerSeconds--;
         io.to(roomCode).emit('timer_tick', room.timerSeconds);
-
         if (room.timerSeconds <= 0) {
             clearInterval(room.nightTimer);
             processNightResults(roomCode);
         }
     }, 1000);
 
-    Object.keys(room.players).forEach(id => {
-        const p = room.players[id];
-        io.to(id).emit('phase_change', {
-            roomCode: roomCode,
-            phase: 'NIGHT',
-            role: p.role,
-            isAlive: p.isAlive,
-            isHost: p.isHost,
-            timer: NIGHT_DURATION,
-            players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
+    io.to(roomCode).emit('phase_change', {
+        roomCode: roomCode,
+        phase: 'NIGHT',
+        timer: NIGHT_DURATION,
+        players: publicPlayers(room)
+    });
+    // Vaidmuo/gyvumas kiekvienam siunčiamas individualiai (skirtingi vaidmenys skirtingiems žaidėjams).
+    Object.values(room.players).forEach(p => {
+        sendToPlayer(room, p.id, 'phase_change', {
+            roomCode: roomCode, phase: 'NIGHT', role: p.role, isAlive: p.isAlive, isHost: p.isHost,
+            timer: NIGHT_DURATION, players: publicPlayers(room)
         });
     });
 }
@@ -387,22 +412,14 @@ function startNightPhase(roomCode) {
 function processNightResults(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
-
     if (room.nightTimer) clearInterval(room.nightTimer);
 
-    // Išrenkama mafijos auka pagal daugumą
     const voteCounts = {};
-    Object.values(room.mafiaVotes).forEach(tid => {
-        voteCounts[tid] = (voteCounts[tid] || 0) + 1;
-    });
+    Object.values(room.mafiaVotes).forEach(tid => { voteCounts[tid] = (voteCounts[tid] || 0) + 1; });
 
-    let mafiaTarget = null;
-    let maxVotes = 0;
+    let mafiaTarget = null, maxVotes = 0;
     Object.keys(voteCounts).forEach(tid => {
-        if (voteCounts[tid] > maxVotes) {
-            maxVotes = voteCounts[tid];
-            mafiaTarget = tid;
-        }
+        if (voteCounts[tid] > maxVotes) { maxVotes = voteCounts[tid]; mafiaTarget = tid; }
     });
 
     let killedId = null;
@@ -411,7 +428,6 @@ function processNightResults(roomCode) {
         if (room.players[killedId]) room.players[killedId].isAlive = false;
     }
 
-    // Gydytojo/detektyvo rezultatai - paskelbiami tik dabar, ryte, ne iš karto nakties metu.
     let doctorOutcome = 'NONE';
     if (room.doctorActed) {
         doctorOutcome = (mafiaTarget && room.doctorTarget && mafiaTarget === room.doctorTarget) ? 'SUCCESS' : 'FAIL';
@@ -434,7 +450,7 @@ function processNightResults(roomCode) {
         }
     }, DAY_VOTE_LIMIT);
 
-    const killedPlayer = killedId ? room.players[killedId].name : null;
+    const killedPlayer = killedId && room.players[killedId] ? room.players[killedId].name : null;
 
     io.to(roomCode).emit('phase_change', {
         roomCode: roomCode,
@@ -442,42 +458,31 @@ function processNightResults(roomCode) {
         killedPlayer: killedPlayer,
         doctorOutcome: doctorOutcome,
         detectiveOutcome: detectiveOutcome,
-        players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
+        players: publicPlayers(room)
     });
 }
 
 function processDayVotingResults(roomCode) {
     const room = rooms[roomCode];
-    if (!room) return;
+    if (!room || room.phase !== 'DAY_VOTING') return;
 
     if (room.dayTimeout) { clearTimeout(room.dayTimeout); room.dayTimeout = null; }
 
+    const aliveCount = Object.values(room.players).filter(p => p.isAlive).length;
     const voteCounts = {};
-    Object.values(room.dayVotes).forEach(targetId => {
-        voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
-    });
+    Object.values(room.dayVotes).forEach(targetId => { voteCounts[targetId] = (voteCounts[targetId] || 0) + 1; });
 
-    let accusedId = null;
-    let maxVotes = 0;
-    let isTie = false;
-
+    let accusedId = null, maxVotes = 0;
     Object.keys(voteCounts).forEach(id => {
-        if (voteCounts[id] > maxVotes) {
-            maxVotes = voteCounts[id];
-            accusedId = id;
-            isTie = false;
-        } else if (voteCounts[id] === maxVotes) {
-            isTie = true;
-        }
+        if (voteCounts[id] > maxVotes) { maxVotes = voteCounts[id]; accusedId = id; }
     });
 
-    // Jei yra lygiosios arba niekas nepabalsuotas – naktis prasideda iš naujo
-    if (!accusedId || isTie || maxVotes <= Object.keys(room.dayVotes).length / 2) {
+    // Reikalinga TIKRA dauguma - daugiau nei pusė VISŲ gyvų žaidėjų, ne tik tų, kurie pabalsavo.
+    if (!accusedId || maxVotes <= aliveCount / 2 || !room.players[accusedId] || !room.players[accusedId].isAlive) {
         startNightPhase(roomCode);
         return;
     }
 
-    // Pereinama į Gynybinės kalbos ir patvirtinimo fazę
     room.phase = 'DAY_DEFENSE';
     room.accusedId = accusedId;
     room.defenseVotes = { yes: 0, no: 0, voted: {} };
@@ -494,23 +499,22 @@ function processDayVotingResults(roomCode) {
         phase: 'DAY_DEFENSE',
         accusedName: room.players[accusedId].name,
         accusedId: accusedId,
-        players: Object.values(room.players).map(x => ({ id: x.id, name: x.name, isAlive: x.isAlive, isHost: x.isHost }))
+        players: publicPlayers(room)
     });
 }
 
 function finalizeElimination(roomCode) {
     const room = rooms[roomCode];
-    if (!room) return;
+    if (!room || room.phase !== 'DAY_DEFENSE') return;
 
     if (room.defenseTimeout) { clearTimeout(room.defenseTimeout); room.defenseTimeout = null; }
 
-    // Jei Dauguma patvirtino išmetimą
     if (room.defenseVotes.yes > room.defenseVotes.no && room.accusedId && room.players[room.accusedId]) {
         room.players[room.accusedId].isAlive = false;
     }
+    room.accusedId = null;
 
     if (checkWinCondition(roomCode)) return;
-
     startNightPhase(roomCode);
 }
 
@@ -528,6 +532,8 @@ function checkWinCondition(roomCode) {
 
     if (winner) {
         if (room.nightTimer) clearInterval(room.nightTimer);
+        if (room.dayTimeout) clearTimeout(room.dayTimeout);
+        if (room.defenseTimeout) clearTimeout(room.defenseTimeout);
         room.phase = 'GAME_OVER';
         const payload = {
             winner: winner,
